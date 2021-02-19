@@ -8,7 +8,7 @@ import time
 from threading import Lock
 import tf.transformations
 import tf
-import utils as Utils
+# import utils as Utils
 
 # messages
 from std_msgs.msg import String, Header, Float32MultiArray
@@ -32,6 +32,192 @@ VAR_CALC_RANGE_MANY_EVAL_SENSOR = 1
 VAR_REPEAT_ANGLES_EVAL_SENSOR = 2
 VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
+
+
+
+class CircularArray(object):
+    """ Simple implementation of a circular array.
+        You can append to it any number of times but only "size" items will be kept
+    """
+    def __init__(self, size):
+        self.arr = np.zeros(size)
+        self.ind = 0
+        self.num_els = 0
+
+    def append(self, value):
+        if self.num_els < self.arr.shape[0]:
+            self.num_els += 1
+        self.arr[self.ind] = value
+        self.ind = (self.ind + 1) % self.arr.shape[0]
+
+    def mean(self):
+        return np.mean(self.arr[:self.num_els])
+
+    def median(self):
+        return np.median(self.arr[:self.num_els])
+
+class Timer:
+    """ Simple helper class to compute the rate at which something is called.
+        
+        "smoothing" determines the size of the underlying circular array, which averages
+        out variations in call rate over time.
+
+        use timer.tick() to record an event
+        use timer.fps() to report the average event rate.
+    """
+    def __init__(self, smoothing):
+        self.arr = CircularArray(smoothing)
+        self.last_time = time.time()
+
+    def tick(self):
+        t = time.time()
+        self.arr.append(1.0 / (t - self.last_time))
+        self.last_time = t
+
+    def fps(self):
+        return self.arr.mean()
+
+def angle_to_quaternion(angle):
+    """Convert an angle in radians into a quaternion _message_."""
+    return Quaternion(*tf.transformations.quaternion_from_euler(0, 0, angle))
+
+def quaternion_to_angle(q):
+    """Convert a quaternion _message_ into an angle in radians.
+    The angle represents the yaw.
+    This is not just the z component of the quaternion."""
+    x, y, z, w = q.x, q.y, q.z, q.w
+    roll, pitch, yaw = tf.transformations.euler_from_quaternion((x, y, z, w))
+    return yaw
+
+def rotation_matrix(theta):
+    ''' Creates a rotation matrix for the given angle in radians '''
+    c, s = np.cos(theta), np.sin(theta)
+    return np.matrix([[c, -s], [s, c]])
+
+def particle_to_pose(particle):
+    ''' Converts a particle in the form [x, y, theta] into a Pose object '''
+    pose = Pose()
+    pose.position.x = particle[0]
+    pose.position.y = particle[1]
+    pose.orientation = angle_to_quaternion(particle[2])
+    return pose
+
+def particles_to_poses(particles):
+    ''' Converts a two dimensional array of particles into an array of Poses. 
+        Particles can be a array like [[x0, y0, theta0], [x1, y1, theta1]...]
+    '''
+    return map(particle_to_pose, particles)
+
+def make_header(frame_id, stamp=None):
+    ''' Creates a Header object for stamped ROS objects '''
+    if stamp == None:
+        stamp = rospy.Time.now()
+    header = Header()
+    header.stamp = stamp
+    header.frame_id = frame_id
+    return header
+
+def map_to_world_slow(x,y,t,map_info):
+    ''' Converts given (x,y,t) coordinates from the coordinate space of the map (pixels) into world coordinates (meters).
+        Provide the MapMetaData object from a map message to specify the change in coordinates.
+        *** Logical, but slow implementation, when you need a lot of coordinate conversions, use the map_to_world function
+    ''' 
+    scale = map_info.resolution
+    angle = quaternion_to_angle(map_info.origin.orientation)
+    rot = rotation_matrix(angle)
+    trans = np.array([[map_info.origin.position.x],
+                      [map_info.origin.position.y]])
+
+    map_c = np.array([[x],
+                      [y]])
+    world = (rot*map_c) * scale + trans
+
+    return world[0,0],world[1,0],t+angle
+
+def map_to_world(poses,map_info):
+    ''' Takes a two dimensional numpy array of poses:
+            [[x0,y0,theta0],
+             [x1,y1,theta1],
+             [x2,y2,theta2],
+                   ...     ]
+        And converts them from map coordinate space (pixels) to world coordinate space (meters).
+        - Conversion is done in place, so this function does not return anything.
+        - Provide the MapMetaData object from a map message to specify the change in coordinates.
+        - This implements the same computation as map_to_world_slow but vectorized and inlined
+    '''
+
+    scale = map_info.resolution
+    angle = quaternion_to_angle(map_info.origin.orientation)
+
+    # rotation
+    c, s = np.cos(angle), np.sin(angle)
+    # we need to store the x coordinates since they will be overwritten
+    temp = np.copy(poses[:,0])
+    poses[:,0] = c*poses[:,0] - s*poses[:,1]
+    poses[:,1] = s*temp       + c*poses[:,1]
+
+    # scale
+    poses[:,:2] *= float(scale)
+
+    # translate
+    poses[:,0] += map_info.origin.position.x
+    poses[:,1] += map_info.origin.position.y
+    poses[:,2] += angle
+
+def world_to_map(poses, map_info):
+    ''' Takes a two dimensional numpy array of poses:
+            [[x0,y0,theta0],
+             [x1,y1,theta1],
+             [x2,y2,theta2],
+                   ...     ]
+        And converts them from world coordinate space (meters) to world coordinate space (pixels).
+        - Conversion is done in place, so this function does not return anything.
+        - Provide the MapMetaData object from a map message to specify the change in coordinates.
+        - This implements the same computation as world_to_map_slow but vectorized and inlined
+        - You may have to transpose the returned x and y coordinates to directly index a pixel array
+    '''
+    scale = map_info.resolution
+    angle = -quaternion_to_angle(map_info.origin.orientation)
+
+    # translation
+    poses[:,0] -= map_info.origin.position.x
+    poses[:,1] -= map_info.origin.position.y
+
+    # scale
+    poses[:,:2] *= (1.0/float(scale))
+
+    # rotation
+    c, s = np.cos(angle), np.sin(angle)
+    # we need to store the x coordinates since they will be overwritten
+    temp = np.copy(poses[:,0])
+    poses[:,0] = c*poses[:,0] - s*poses[:,1]
+    poses[:,1] = s*temp       + c*poses[:,1]
+    poses[:,2] += angle
+
+def world_to_map_slow(x,y,t, map_info):
+    ''' Converts given (x,y,t) coordinates from the coordinate space of the world (meters) into map coordinates (pixels).
+        Provide the MapMetaData object from a map message to specify the change in coordinates.
+        *** Logical, but slow implementation, when you need a lot of coordinate conversions, use the world_to_map function
+    ''' 
+    scale = map_info.resolution
+    angle = quaternion_to_angle(map_info.origin.orientation)
+    rot = rotation_matrix(-angle)
+    trans = np.array([[map_info.origin.position.x],
+                      [map_info.origin.position.y]])
+
+    world = np.array([[x],
+                      [y]])
+    map_c = rot*((world - trans) / float(scale))
+    return map_c[0,0],map_c[1,0],t-angle
+
+
+
+
+
+
+
+
+
 
 class ParticleFiler():
     '''
@@ -98,8 +284,8 @@ class ParticleFiler():
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
 
         # initialize the state
-        self.smoothing = Utils.CircularArray(10)
-        self.timer = Utils.Timer(10)
+        self.smoothing = CircularArray(10) # Utils
+        self.timer = Timer(10) # Utils
         self.get_omap()
         self.precompute_sensor_model()
         self.initialize_global()
@@ -122,7 +308,7 @@ class ParticleFiler():
         self.pose_sub  = rospy.Subscriber("/initialpose", PoseWithCovarianceStamped, self.clicked_pose, queue_size=1)
         self.click_sub = rospy.Subscriber("/clicked_point", PointStamped, self.clicked_pose, queue_size=1)
 
-        print "Finished initializing, waiting on messages..."
+        print("Finished initializing, waiting on messages...")
 
     def get_omap(self):
         '''
@@ -140,13 +326,13 @@ class ParticleFiler():
         self.MAX_RANGE_PX = int(self.MAX_RANGE_METERS / self.map_info.resolution)
 
         # initialize range method
-        print "Initializing range method:", self.WHICH_RM
+        print("Initializing range method:", self.WHICH_RM)
         if self.WHICH_RM == "bl":
             self.range_method = range_libc.PyBresenhamsLine(oMap, self.MAX_RANGE_PX)
         elif "cddt" in self.WHICH_RM:
             self.range_method = range_libc.PyCDDTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
             if self.WHICH_RM == "pcddt":
-                print "Pruning..."
+                print("Pruning...")
                 self.range_method.prune()
         elif self.WHICH_RM == "rm":
             self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
@@ -154,7 +340,7 @@ class ParticleFiler():
             self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
         elif self.WHICH_RM == "glt":
             self.range_method = range_libc.PyGiantLUTCast(oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION)
-        print "Done loading map"
+        print("Done loading map")
 
          # 0: permissible, -1: unmapped, 100: blocked
         array_255 = np.array(map_msg.data).reshape((map_msg.info.height, map_msg.info.width))
@@ -176,10 +362,10 @@ class ParticleFiler():
         # also publish odometry to facilitate getting the localization pose
         if self.PUBLISH_ODOM:
             odom = Odometry()
-            odom.header = Utils.make_header("/map", stamp)
+            odom.header = make_header("/map", stamp) # Utils
             odom.pose.pose.position.x = pose[0]
             odom.pose.pose.position.y = pose[1]
-            odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
+            odom.pose.pose.orientation = angle_to_quaternion(pose[2]) # Utils
             self.odom_pub.publish(odom)
         
         return # below this line is disabled
@@ -215,10 +401,10 @@ class ParticleFiler():
         if self.pose_pub.get_num_connections() > 0 and isinstance(self.inferred_pose, np.ndarray):
             # Publish the inferred pose for visualization
             ps = PoseStamped()
-            ps.header = Utils.make_header("map")
+            ps.header = make_header("map") # Utils
             ps.pose.position.x = self.inferred_pose[0]
             ps.pose.position.y = self.inferred_pose[1]
-            ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
+            ps.pose.orientation = angle_to_quaternion(self.inferred_pose[2]) # Utils
             self.pose_pub.publish(ps)
 
         if self.particle_pub.get_num_connections() > 0:
@@ -242,14 +428,14 @@ class ParticleFiler():
     def publish_particles(self, particles):
         # publish the given particles as a PoseArray object
         pa = PoseArray()
-        pa.header = Utils.make_header("map")
-        pa.poses = Utils.particles_to_poses(particles)
+        pa.header = make_header("map") # Utils
+        pa.poses = particles_to_poses(particles) # Utils
         self.particle_pub.publish(pa)
 
     def publish_scan(self, angles, ranges):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
-        ls.header = Utils.make_header("laser", stamp=self.last_stamp)
+        ls.header = make_header("laser", stamp=self.last_stamp) # Utils
         ls.angle_min = np.min(angles)
         ls.angle_max = np.max(angles)
         ls.angle_increment = np.abs(angles[0] - angles[1])
@@ -263,12 +449,12 @@ class ParticleFiler():
         Initializes reused buffers, and stores the relevant laser scanner data for later use.
         '''
         if not isinstance(self.laser_angles, np.ndarray):
-            print "...Received first LiDAR message"
+            print("...Received first LiDAR message")
             self.laser_angles = np.linspace(msg.angle_min, msg.angle_max, len(msg.ranges))
             self.downsampled_angles = np.copy(self.laser_angles[0::self.ANGLE_STEP]).astype(np.float32)
             self.viz_queries = np.zeros((self.downsampled_angles.shape[0],3), dtype=np.float32)
             self.viz_ranges = np.zeros(self.downsampled_angles.shape[0], dtype=np.float32)
-            print self.downsampled_angles.shape[0]
+            print(self.downsampled_angles.shape[0])
 
         # store the necessary scanner information for later processing
         self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
@@ -285,12 +471,12 @@ class ParticleFiler():
             msg.pose.pose.position.x,
             msg.pose.pose.position.y])
 
-        orientation = Utils.quaternion_to_angle(msg.pose.pose.orientation)
+        orientation = quaternion_to_angle(msg.pose.pose.orientation) # Utils
         pose = np.array([position[0], position[1], orientation])
 
         if isinstance(self.last_pose, np.ndarray):
             # changes in x,y,theta in local coordinate system of the car
-            rot = Utils.rotation_matrix(-self.last_pose[2])
+            rot = rotation_matrix(-self.last_pose[2]) # Utils
             delta = np.array([position - self.last_pose[0:2]]).transpose()
             local_delta = (rot*delta).transpose()
             
@@ -299,7 +485,7 @@ class ParticleFiler():
             self.last_stamp = msg.header.stamp
             self.odom_initialized = True
         else:
-            print "...Received first Odometry message"
+            print("...Received first Odometry message")
             self.last_pose = pose
 
         # this topic is slower than lidar, so update every time we receive a message
@@ -318,20 +504,20 @@ class ParticleFiler():
         '''
         Initialize particles in the general region of the provided pose.
         '''
-        print "SETTING POSE"
-        print pose
+        print("SETTING POSE")
+        print(pose)
         self.state_lock.acquire()
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
         self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
         self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=0.4,size=self.MAX_PARTICLES)
+        self.particles[:,2] = quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=0.4,size=self.MAX_PARTICLES) # Utils
         self.state_lock.release()
 
     def initialize_global(self):
         '''
         Spread the particle distribution over the permissible region of the state space.
         '''
-        print "GLOBAL INITIALIZATION"
+        print("GLOBAL INITIALIZATION")
         # randomize over grid coordinate space
         self.state_lock.acquire()
         permissible_x, permissible_y = np.where(self.permissible_region == 1)
@@ -342,7 +528,7 @@ class ParticleFiler():
         permissible_states[:,1] = permissible_x[indices]
         permissible_states[:,2] = np.random.random(self.MAX_PARTICLES) * np.pi * 2.0
 
-        Utils.map_to_world(permissible_states, self.map_info)
+        map_to_world(permissible_states, self.map_info) # Utils
         self.particles = permissible_states
         self.weights[:] = 1.0 / self.MAX_PARTICLES
         self.state_lock.release()
@@ -355,7 +541,7 @@ class ParticleFiler():
         This table is indexed by the sensor model at runtime by discretizing the measurements
         and computed ranges from RangeLibc.
         '''
-        print "Precomputing sensor model"
+        print("Precomputing sensor model")
         # sensor model constants
         z_short = self.Z_SHORT
         z_max   = self.Z_MAX
@@ -368,11 +554,11 @@ class ParticleFiler():
 
         t = time.time()
         # d is the computed range from RangeLibc
-        for d in xrange(table_width):
+        for d in range(table_width):
             norm = 0.0
             sum_unkown = 0.0
             # r is the observed range from the lidar unit
-            for r in xrange(table_width):
+            for r in range(table_width):
                 prob = 0.0
                 z = float(r-d)
                 # reflects from the intended object
@@ -496,7 +682,7 @@ class ParticleFiler():
                 # apply the squash factor
                 self.weights = np.power(self.weights, self.INV_SQUASH_FACTOR)
             else:
-                print "Cannot use radial optimizations with non-CDDT based methods, use rangelib_variant 2"
+                print("Cannot use radial optimizations with non-CDDT based methods, use rangelib_variant 2")
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT:
             self.queries[:,:] = proposal_dist[:,:]
             self.range_method.calc_range_repeat_angles_eval_sensor_model(self.queries, self.downsampled_angles, obs, self.weights)
@@ -521,8 +707,8 @@ class ParticleFiler():
                 t_total = (t_squash - t_start) / 100.0
 
             if self.SHOW_FINE_TIMING and self.iters % 10 == 0:
-                print "sensor_model: init: ", np.round((t_init-t_start)/t_total, 2), "range:", np.round((t_range-t_init)/t_total, 2), \
-                      "eval:", np.round((t_eval-t_range)/t_total, 2), "squash:", np.round((t_squash-t_eval)/t_total, 2)
+                print("sensor_model: init: ", np.round((t_init-t_start)/t_total, 2), "range:", np.round((t_range-t_init)/t_total, 2), \
+                      "eval:", np.round((t_eval-t_range)/t_total, 2), "squash:", np.round((t_squash-t_eval)/t_total, 2))
         elif self.RANGELIB_VAR == VAR_CALC_RANGE_MANY_EVAL_SENSOR:
             # this version demonstrates what this would look like with coordinate space conversion pushed to rangelib
             # this part is inefficient since it requires a lot of effort to construct this redundant array
@@ -556,12 +742,12 @@ class ParticleFiler():
             intrng = np.rint(ranges).astype(np.uint16)
 
             # compute the weight for each particle
-            for i in xrange(self.MAX_PARTICLES):
+            for i in range(self.MAX_PARTICLES):
                 weight = np.product(self.sensor_model_table[intobs,intrng[i*num_rays:(i+1)*num_rays]])
                 weight = np.power(weight, self.INV_SQUASH_FACTOR)
                 weights[i] = weight
         else:
-            print "PLEASE SET rangelib_variant PARAM to 0-4"
+            print("PLEASE SET rangelib_variant PARAM to 0-4")
 
     def MCL(self, a, o):
         '''
@@ -598,8 +784,8 @@ class ParticleFiler():
             t_total = (t_norm - t)/100.0
 
         if self.SHOW_FINE_TIMING and self.iters % 10 == 0:
-            print "MCL: propose: ", np.round((t_propose-t)/t_total, 2), "motion:", np.round((t_motion-t_propose)/t_total, 2), \
-                  "sensor:", np.round((t_sensor-t_motion)/t_total, 2), "norm:", np.round((t_norm-t_sensor)/t_total, 2)
+            print("MCL: propose: ", np.round((t_propose-t)/t_total, 2), "motion:", np.round((t_motion-t_propose)/t_total, 2), \
+                  "sensor:", np.round((t_sensor-t_motion)/t_total, 2), "norm:", np.round((t_norm-t_sensor)/t_total, 2))
 
         # save the particles
         self.particles = proposal_distribution
@@ -616,7 +802,7 @@ class ParticleFiler():
         '''
         if self.lidar_initialized and self.odom_initialized and self.map_initialized:
             if self.state_lock.locked():
-                print "Concurrency error avoided"
+                print("Concurrency error avoided")
             else:
                 self.state_lock.acquire()
                 self.timer.tick()
@@ -642,7 +828,7 @@ class ParticleFiler():
                 ips = 1.0 / (t2 - t1)
                 self.smoothing.append(ips)
                 if self.iters % 10 == 0:
-                    print "iters per sec:", int(self.timer.fps()), " possible:", int(self.smoothing.mean())
+                    print("iters per sec:", int(self.timer.fps()), " possible:", int(self.smoothing.mean()))
 
                 self.visualize()
 
@@ -656,7 +842,7 @@ def load_params_from_yaml(fp):
     with open(fp, 'r') as infile:
         yaml_data = load(infile)
         for param in yaml_data:
-            print "param:", param, ":", yaml_data[param]
+            print("param:", param, ":", yaml_data[param])
             rospy.set_param("~"+param, yaml_data[param])
 
 # this function can be used to generate flame graphs easily
